@@ -18,6 +18,8 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coreos/go-semver/semver"
@@ -27,6 +29,9 @@ import (
 	"github.com/pingcap/tidb/br/pkg/version"
 	"github.com/pingcap/tidb/dumpling/export"
 	timodel "github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	tidbmysql "github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tiflow/cdc/model"
 	"github.com/pingcap/tiflow/cdc/sink/ddlsink"
 	"github.com/pingcap/tiflow/cdc/sink/metrics"
@@ -37,6 +42,7 @@ import (
 	"github.com/pingcap/tiflow/pkg/retry"
 	"github.com/pingcap/tiflow/pkg/sink"
 	pmysql "github.com/pingcap/tiflow/pkg/sink/mysql"
+	"github.com/tikv/client-go/v2/oracle"
 	"go.uber.org/zap"
 )
 
@@ -223,7 +229,7 @@ func (m *DDLSink) execDDL(pctx context.Context, ddl *model.DDLEvent) error {
 
 	start := time.Now()
 	log.Info("Start exec DDL", zap.String("namespace", m.id.Namespace), zap.String("changefeed", m.id.ID),
-		zap.Uint64("commitTs", ddl.CommitTs), zap.String("DDL", ddl.Query))
+		zap.Uint64("commitTs", ddl.CommitTs), zap.Uint64("startTs", ddl.StartTs), zap.String("DDL", ddl.Query))
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -232,6 +238,9 @@ func (m *DDLSink) execDDL(pctx context.Context, ddl *model.DDLEvent) error {
 	if shouldSwitchDB {
 		_, err = tx.ExecContext(ctx, "USE "+quotes.QuoteName(ddl.TableInfo.TableName.Schema)+";")
 		if err != nil {
+			if tsErr := resetSessionTimestamp(ctx, tx); tsErr != nil {
+				log.Warn("Failed to reset session timestamp after USE failure", zap.Error(tsErr))
+			}
 			if rbErr := tx.Rollback(); rbErr != nil {
 				log.Error("Failed to rollback", zap.String("namespace", m.id.Namespace),
 					zap.String("changefeed", m.id.ID), zap.Error(err))
@@ -252,7 +261,44 @@ func (m *DDLSink) execDDL(pctx context.Context, ddl *model.DDLEvent) error {
 		return err
 	}
 
+	// Each DDL statement should use its own StartTs timestamp from upstream
+	// This ensures that timestamp functions like NOW(), CURRENT_TIMESTAMP(), LOCALTIME()
+	// are evaluated with the exact same temporal context as upstream
+	tsToUse := ddl.StartTs
+	if tsToUse == 0 {
+		// If StartTs is not available, fall back to CommitTs
+		// This preserves timestamp consistency for DDL statements executed in the same transaction
+		tsToUse = ddl.CommitTs
+	}
+	ddlTime := oracle.GetTimeFromTS(tsToUse)
+	// Use second-level precision to match upstream default value evaluation.
+	ddlTimestamp := float64(ddlTime.Unix())
+
+	if ts, ok := ddlSessionTimestampFromOriginDefault(ddl, m.cfg.Timezone); ok {
+		ddlTimestamp = ts
+	}
+
+	// Set the session timestamp to match upstream DDL execution time
+	// This is critical for preserving timestamp function behavior
+	if err := setSessionTimestamp(ctx, tx, ddlTimestamp); err != nil {
+		log.Error("Fail to set session timestamp for DDL",
+			zap.Float64("timestamp", ddlTimestamp),
+			zap.Uint64("startTs", tsToUse),
+			zap.Uint64("commitTs", ddl.CommitTs),
+			zap.String("query", ddl.Query),
+			zap.Error(err))
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Error("Failed to rollback", zap.String("namespace", m.id.Namespace),
+				zap.String("changefeed", m.id.ID), zap.Error(err))
+		}
+		return err
+	}
+
 	if _, err = tx.ExecContext(ctx, ddl.Query); err != nil {
+		log.Error("Failed to execute DDL", zap.Any("err", err), zap.Any("query", ddl.Query))
+		if tsErr := resetSessionTimestamp(ctx, tx); tsErr != nil {
+			log.Warn("Failed to reset session timestamp after DDL execution failure", zap.Error(tsErr))
+		}
 		if rbErr := tx.Rollback(); rbErr != nil {
 			log.Error("Failed to rollback",
 				zap.String("namespace", m.id.Namespace),
@@ -263,6 +309,22 @@ func (m *DDLSink) execDDL(pctx context.Context, ddl *model.DDLEvent) error {
 		return err
 	}
 
+	// Reset session timestamp after DDL execution to avoid affecting subsequent operations
+	if err := resetSessionTimestamp(ctx, tx); err != nil {
+		log.Error("Failed to reset session timestamp after DDL execution", zap.Error(err))
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Error("Failed to rollback", zap.String("namespace", m.id.Namespace),
+				zap.String("changefeed", m.id.ID), zap.Error(err))
+		}
+		return errors.WrapError(errors.ErrMySQLTxnError, errors.WithMessage(err, fmt.Sprintf("Query info: %s; ", ddl.Query)))
+	}
+
+	// Log successful DDL execution with timestamp information for debugging
+	log.Debug("DDL executed with timestamp",
+		zap.String("query", ddl.Query),
+		zap.Uint64("startTs", tsToUse),
+		zap.Float64("sessionTimestamp", ddlTimestamp))
+
 	if err = tx.Commit(); err != nil {
 		log.Error("Failed to exec DDL", zap.String("namespace", m.id.Namespace), zap.String("changefeed", m.id.ID),
 			zap.Duration("duration", time.Since(start)), zap.String("sql", ddl.Query), zap.Error(err))
@@ -271,8 +333,162 @@ func (m *DDLSink) execDDL(pctx context.Context, ddl *model.DDLEvent) error {
 
 	log.Info("Exec DDL succeeded",
 		zap.String("namespace", m.id.Namespace), zap.String("changefeed", m.id.ID),
-		zap.Duration("duration", time.Since(start)), zap.String("sql", ddl.Query))
+		zap.Duration("duration", time.Since(start)), zap.Uint64("startTs", tsToUse),
+		zap.Float64("sessionTimestamp", ddlTimestamp), zap.String("sql", ddl.Query))
 	return nil
+}
+
+func setSessionTimestamp(ctx context.Context, tx *sql.Tx, unixTimestamp float64) error {
+	_, err := tx.ExecContext(ctx, fmt.Sprintf("SET TIMESTAMP = %s", formatUnixTimestamp(unixTimestamp)))
+	return err
+}
+
+func resetSessionTimestamp(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, "SET TIMESTAMP = DEFAULT")
+	return err
+}
+
+func formatUnixTimestamp(unixTimestamp float64) string {
+	return strconv.FormatFloat(unixTimestamp, 'f', 6, 64)
+}
+
+func ddlSessionTimestampFromOriginDefault(ddl *model.DDLEvent, timezone string) (float64, bool) {
+	if ddl == nil || ddl.TableInfo == nil {
+		return 0, false
+	}
+	targetColumns, err := extractCurrentTimestampDefaultColumns(ddl.Query)
+	if err != nil || len(targetColumns) == 0 {
+		return 0, false
+	}
+
+	for _, col := range ddl.TableInfo.Columns {
+		if _, ok := targetColumns[col.Name.L]; !ok {
+			continue
+		}
+		val := col.GetOriginDefaultValue()
+		valStr, ok := val.(string)
+		if !ok || valStr == "" {
+			continue
+		}
+		ts, err := parseOriginDefaultTimestamp(valStr, col, timezone)
+		if err != nil {
+			log.Warn("Failed to parse OriginDefaultValue for DDL timestamp",
+				zap.String("column", col.Name.O),
+				zap.String("originDefault", valStr),
+				zap.Error(err))
+			continue
+		}
+		log.Info("Using OriginDefaultValue for DDL timestamp",
+			zap.String("column", col.Name.O),
+			zap.String("originDefault", valStr),
+			zap.Float64("timestamp", ts),
+			zap.String("timezone", timezone))
+		return ts, true
+	}
+
+	return 0, false
+}
+
+func extractCurrentTimestampDefaultColumns(query string) (map[string]struct{}, error) {
+	p := parser.New()
+	stmt, err := p.ParseOneStmt(query, "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	cols := make(map[string]struct{})
+	switch s := stmt.(type) {
+	case *ast.CreateTableStmt:
+		for _, col := range s.Cols {
+			if hasCurrentTimestampDefault(col) {
+				cols[col.Name.Name.L] = struct{}{}
+			}
+		}
+	case *ast.AlterTableStmt:
+		for _, spec := range s.Specs {
+			switch spec.Tp {
+			case ast.AlterTableAddColumns, ast.AlterTableModifyColumn, ast.AlterTableChangeColumn, ast.AlterTableAlterColumn:
+				for _, col := range spec.NewColumns {
+					if hasCurrentTimestampDefault(col) {
+						cols[col.Name.Name.L] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	return cols, nil
+}
+
+func hasCurrentTimestampDefault(col *ast.ColumnDef) bool {
+	if col == nil {
+		return false
+	}
+	for _, opt := range col.Options {
+		if opt.Tp != ast.ColumnOptionDefaultValue {
+			continue
+		}
+		if isCurrentTimestampExpr(opt.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCurrentTimestampExpr(expr ast.ExprNode) bool {
+	if expr == nil {
+		return false
+	}
+	switch v := expr.(type) {
+	case *ast.FuncCallExpr:
+		return isCurrentTimestampFuncName(v.FnName.L)
+	case ast.ValueExpr:
+		return isCurrentTimestampFuncName(strings.ToLower(v.GetString()))
+	default:
+		return false
+	}
+}
+
+func isCurrentTimestampFuncName(name string) bool {
+	switch name {
+	case ast.CurrentTimestamp, ast.Now, ast.LocalTime, ast.LocalTimestamp:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseOriginDefaultTimestamp(val string, col *timodel.ColumnInfo, timezone string) (float64, error) {
+	loc, err := resolveOriginDefaultLocation(col, timezone)
+	if err != nil {
+		return 0, err
+	}
+	return parseTimestampInLocation(val, loc)
+}
+
+func resolveOriginDefaultLocation(col *timodel.ColumnInfo, timezone string) (*time.Location, error) {
+	if col != nil && col.GetType() == tidbmysql.TypeTimestamp && col.Version >= timodel.ColumnInfoVersion1 {
+		return time.UTC, nil
+	}
+	if timezone == "" {
+		return time.UTC, nil
+	}
+	tz := strings.Trim(timezone, "\"")
+	return time.LoadLocation(tz)
+}
+
+func parseTimestampInLocation(val string, loc *time.Location) (float64, error) {
+	formats := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999",
+	}
+	for _, f := range formats {
+		t, err := time.ParseInLocation(f, val, loc)
+		if err == nil {
+			return float64(t.UnixNano()) / float64(time.Second), nil
+		}
+	}
+	return 0, fmt.Errorf("failed to parse timestamp: %s", val)
 }
 
 func needSwitchDB(ddl *model.DDLEvent) bool {
